@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#172554">
+<title>تست منشی هوشمند آموزشگاه</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f3f5f9;color:#172033;font-family:Tahoma,Arial,sans-serif}
+main{max-width:560px;margin:36px auto;padding:24px}
+.card{background:white;border:1px solid #e2e8f0;border-radius:18px;padding:24px;box-shadow:0 8px 28px #0f172a0d}
+h1{font-size:22px;margin:0 0 10px}p{line-height:1.9;color:#475569}
+button{width:100%;border:0;border-radius:12px;padding:15px;font-size:16px;font-weight:bold;margin-top:12px;cursor:pointer}
+#start{background:#1d4ed8;color:white}#stop{background:#e2e8f0;color:#172033}
+#status{padding:12px;background:#f1f5f9;border-radius:10px;margin-top:16px;min-height:48px}
+#log{white-space:pre-wrap;line-height:1.8;font-size:14px;max-height:220px;overflow:auto;margin-top:16px}
+.small{font-size:12px;color:#64748b}
+</style>
+</head>
+<body>
+<main><section class="card">
+<h1>منشی هوشمند آموزشگاه</h1>
+<p>نمونهٔ آزمایشی مکالمهٔ صوتی فارسی با مدل <b>gpt-realtime-mini</b> از طریق 1xAI. برای شروع، اجازهٔ استفاده از میکروفون را بده.</p>
+<button id="start">شروع مکالمه</button>
+<button id="stop" disabled>پایان مکالمه</button>
+<div id="status">وضعیت: آمادهٔ شروع</div>
+<div id="log" aria-live="polite"></div>
+<p class="small">این نسخه صرفاً برای آزمایش است؛ اطلاعات شخصی یا محرمانه وارد نکن.</p>
+</section></main>
+<script>
+const $ = id => document.getElementById(id);
+let ws, stream, audioCtx, processor, source, muteNode, nextPlayTime=0, active=false;
+const log = s => { $("log").textContent += s + "\n"; $("log").scrollTop=$("log").scrollHeight; };
+const status = s => $("status").textContent = "وضعیت: " + s;
+function b64bytes(b64){const bin=atob(b64), out=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)out[i]=bin.charCodeAt(i);return out;}
+function bytesB64(bytes){let bin="";for(let i=0;i<bytes.length;i++)bin+=String.fromCharCode(bytes[i]);return btoa(bin);}
+function resampleTo24k(input, inputRate){
+  const ratio=inputRate/24000, length=Math.floor(input.length/ratio), out=new Int16Array(length);
+  for(let i=0;i<length;i++){
+    const pos=i*ratio, idx=Math.floor(pos), frac=pos-idx;
+    const a=input[idx]||0, b=input[Math.min(idx+1,input.length-1)]||0;
+    let v=a+(b-a)*frac; v=Math.max(-1,Math.min(1,v));
+    out[i]=v<0?v*32768:v*32767;
+  }
+  return new Uint8Array(out.buffer);
+}
+function playPCM(b64){
+  const bytes=b64bytes(b64);
+  const samples=new Int16Array(bytes.buffer,bytes.byteOffset,Math.floor(bytes.byteLength/2));
+  const buffer=audioCtx.createBuffer(1,samples.length,24000), channel=buffer.getChannelData(0);
+  for(let i=0;i<samples.length;i++) channel[i]=samples[i]/32768;
+  const node=audioCtx.createBufferSource(); node.buffer=buffer; node.connect(audioCtx.destination);
+  const now=audioCtx.currentTime; nextPlayTime=Math.max(nextPlayTime,now+0.03);
+  node.start(nextPlayTime); nextPlayTime+=buffer.duration;
+}
+async function start(){
+  $("start").disabled=true; status("در حال اتصال...");
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1, echoCancellation:true, noiseSuppression:true, autoGainControl:true}});
+    audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+    await audioCtx.resume();
+    const tokenRes=await fetch("/voice-token",{method:"POST"});
+    if(!tokenRes.ok) throw new Error(await tokenRes.text());
+    const token=await tokenRes.json();
+    ws=new WebSocket(token.url+"?client_secret="+encodeURIComponent(token.client_secret.value));
+    ws.onopen=()=>{
+      active=true; $("stop").disabled=false; status("متصل؛ منشی در حال آماده شدن");
+      ws.send(JSON.stringify({type:"session.update",session:{
+        instructions:"تو منشی تلفنی فارسی‌زبان یک آموزشگاه آموزش پادکست و گویندگی هستی. با فارسی روان، محترمانه، گرم و کوتاه صحبت کن. فعلاً اطلاعات قطعی درباره قیمت، زمان‌بندی، سرفصل‌ها یا مدرسین در اختیار نداری؛ چیزی جعل نکن و اگر پرسیده شد بگو برای پاسخ دقیق باید از مسئول آموزشگاه استعلام شود. مکالمه را با این جمله آغاز کن: سلام، وقت شما بخیر. به آموزشگاه خوش آمدید. چطور می‌توانم راهنمایی‌تان کنم؟",
+        audio:{input:{format:"pcm16",turn_detection:{type:"server_vad",interrupt_response:true}},output:{format:"pcm16",voice:"alloy"}}
+      }}));
+      ws.send(JSON.stringify({type:"response.create"}));
+      status("مکالمه برقرار شد؛ صحبت کن");
+    };
+    ws.onmessage=e=>{
+      const ev=JSON.parse(e.data);
+      if(ev.type==="response.output_audio.delta") playPCM(ev.delta);
+      if(ev.type==="conversation.item.input_audio_transcription.completed") log("شما: "+ev.transcript);
+      if(ev.type==="response.output_audio_transcript.delta") { /* streamed speech transcript */ }
+      if(ev.type==="response.output_audio_transcript.done") log("منشی: "+ev.transcript);
+      if(ev.type==="error") {log("خطا: "+JSON.stringify(ev.error));status("خطا در سرویس");}
+    };
+    ws.onerror=()=>{status("خطای ارتباط WebSocket");};
+    ws.onclose=()=>{if(active) status("ارتباط قطع شد"); cleanup(false);};
+    source=audioCtx.createMediaStreamSource(stream);
+    processor=audioCtx.createScriptProcessor(4096,1,1);
+    muteNode=audioCtx.createGain(); muteNode.gain.value=0;
+    processor.onaudioprocess=e=>{
+      if(!active||!ws||ws.readyState!==WebSocket.OPEN)return;
+      const pcm=resampleTo24k(e.inputBuffer.getChannelData(0),audioCtx.sampleRate);
+      ws.send(JSON.stringify({type:"input_audio_buffer.append",audio:bytesB64(pcm)}));
+    };
+    source.connect(processor); processor.connect(muteNode); muteNode.connect(audioCtx.destination);
+  }catch(err){status("شروع ناموفق: "+err.message);log("خطا: "+err.message);cleanup(true);$("start").disabled=false;}
+}
+function cleanup(closeSocket=true){
+  active=false;
+  if(processor){processor.disconnect();processor.onaudioprocess=null;processor=null;}
+  if(source){source.disconnect();source=null;}
+  if(muteNode){muteNode.disconnect();muteNode=null;}
+  if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}
+  if(closeSocket&&ws&&ws.readyState<2)ws.close();
+  if(audioCtx){audioCtx.close();audioCtx=null;}
+  $("start").disabled=false;$("stop").disabled=true;
+}
+$("start").onclick=start;
+$("stop").onclick=()=>{status("تماس پایان یافت");cleanup(true);};
+</script>
+</body></html>
